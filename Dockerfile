@@ -6,11 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar Hermes Agent (binary precompilado para Linux amd64)
-# Usamos la release oficial de GitHub
-RUN curl -fsSL https://github.com/NousResearch/hermes-agent/releases/latest/download/hermes-agent-linux-amd64.tar.gz \
-    | tar -xz -C /usr/local/bin hermes \
-    && chmod +x /usr/local/bin/hermes
+# Instalar Hermes Agent (script oficial - siempre actualizado)
+RUN curl -fsSL https://get.hermes-agent.com | sh -s -- -b /usr/local/bin
 
 # Verificar instalación
 RUN hermes --version || echo "Hermes instalado"
