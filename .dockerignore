@@ -1,0 +1,15 @@
+# .dockerignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv
+.env
+session.json
+logs
+*.log
+.git
+.gitignore
+*.bat
+*.md
