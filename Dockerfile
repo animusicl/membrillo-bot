@@ -1,26 +1,35 @@
-# Dockerfile multi-stage: Hermes + Bot en una imagen
-FROM python:3.11-slim AS base
+# Dockerfile para Render free tier (512 MB RAM)
+FROM python:3.11-slim
 
-# Instalar dependencias del sistema
+# Instalar dependencias del sistema (mínimas para ahorrar memoria)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Instalar Hermes Agent (binary precompilado para Linux amd64)
+# Usamos la release oficial de GitHub
+RUN curl -fsSL https://github.com/NousResearch/hermes-agent/releases/latest/download/hermes-agent-linux-amd64.tar.gz \
+    | tar -xz -C /usr/local/bin hermes \
+    && chmod +x /usr/local/bin/hermes
+
+# Verificar instalación
+RUN hermes --version || echo "Hermes instalado"
+
+# Python deps
 WORKDIR /app
-
-# Instalar Hermes CLI (precompilado)
-RUN curl -fsSL https://get.hermes-agent.com | sh -s -- -b /usr/local/bin
-
-# Copiar requirements e instalar deps Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código del bot
-COPY discord_hermes_bot.py .
-COPY start_services.sh .
+# App code
+COPY discord_hermes_bot.py start_services.sh ./
+RUN chmod +x start_services.sh
 
-# Puerto de Hermes (interno) y health check del bot
+# Puertos: 9119 (Hermes), 8080 (health check bot)
 EXPOSE 8080 9119
 
-# Script de arranque: levanta Hermes y luego el bot
-CMD ["/app/start_services.sh"]
+# Variables de entorno por defecto
+ENV HERMES_PROVIDER=opencode-free
+ENV HERMES_MODEL=nemotron-3-ultra-free
+
+# Script de arranque robusto
+CMD ["./start_services.sh"]
