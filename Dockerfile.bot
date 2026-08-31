@@ -1,0 +1,22 @@
+# Dockerfile SOLO para el bot (sin Hermes) - Render free tier 512 MB
+FROM python:3.11-slim
+
+# Dependencias mínimas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY discord_hermes_bot.py ./
+
+# Puerto health check
+EXPOSE 8080
+
+# Variables por defecto
+ENV HERMES_MODEL=nemotron-3-ultra-free
+
+# Health check server + bot
+CMD ["python", "discord_hermes_bot.py"]
