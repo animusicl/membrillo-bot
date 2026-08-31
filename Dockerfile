@@ -20,7 +20,7 @@ COPY discord_hermes_bot.py .
 COPY start_services.sh .
 
 # Puerto de Hermes (interno) y health check del bot
-EXPOSE 9119
+EXPOSE 8080 9119
 
 # Script de arranque: levanta Hermes y luego el bot
 CMD ["/app/start_services.sh"]

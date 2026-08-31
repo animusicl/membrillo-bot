@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: hermes-discord-bot
+    runtime: docker
+    repo: https://github.com/animusicl/membrillo-bot
+    branch: master
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: HERMES_MODEL
+        value: nemotron-3-ultra-free
+      - key: MAX_HISTORY
+        value: "500"
+      - key: HERMES_URL
+        value: http://localhost:9119
+    # Render free tier: 512 MB RAM, 0.5 CPU, sleep after 15 min inactivity
+    # UptimeRobot (gratis) pingea /health cada 5 min -> evita sleep
