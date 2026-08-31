@@ -209,6 +209,9 @@ async def on_ready():
         log.info(f"Slash commands sincronizados: {len(synced)}")
     except Exception as e:
         log.error(f"Error sincronizando comandos: {e}")
+    
+    # Iniciar health check server en EL MISMO loop del bot
+    bot.loop.create_task(start_health_server())
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -352,17 +355,11 @@ async def start_health_server():
     await site.start()
     log.info("Health check server en puerto 8080")
 
-# ─── Main ───
 if __name__ == "__main__":
     log.info("Iniciando Hermes Discord Bot...")
     log.info(f"Hermes URL: {CFG.HERMES_URL}")
     log.info(f"Modelo: {CFG.HERMES_MODEL}")
     log.info(f"Max history: {CFG.MAX_HISTORY}")
-
-    # Iniciar health check server en background
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(start_health_server())
 
     try:
         bot.run(CFG.DISCORD_TOKEN)
@@ -371,5 +368,5 @@ if __name__ == "__main__":
     except Exception as e:
         log.exception(f"Error fatal: {e}")
     finally:
-        loop.run_until_complete(shutdown())
-        loop.close()
+        # Nota: bot.run() bloquea, el cleanup real ocurre en signal handler si hace falta
+        pass
