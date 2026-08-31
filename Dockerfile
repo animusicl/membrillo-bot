@@ -6,11 +6,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar Hermes Agent (script oficial - siempre actualizado)
-RUN curl -fsSL https://get.hermes-agent.com | sh -s -- -b /usr/local/bin
+# Instalar Hermes Agent (script oficial - instala en ~/.local/bin)
+RUN curl -fsSL https://get.hermes-agent.com | sh -s -- -b /root/.local/bin
+
+# Agregar al PATH
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Verificar instalación
-RUN hermes --version || echo "Hermes instalado"
+RUN hermes --version || echo "Hermes instalado en ~/.local/bin"
 
 # Python deps
 WORKDIR /app
