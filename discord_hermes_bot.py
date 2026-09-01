@@ -14,6 +14,7 @@ import json
 import asyncio
 import logging
 import time
+import re
 from collections import deque
 from pathlib import Path
 from typing import Dict, Deque, List, Optional, Any, AsyncGenerator
@@ -33,7 +34,7 @@ load_dotenv()
 class Config:
     DISCORD_TOKEN: str
     OPENROUTER_API_KEY: str
-    HERMES_MODEL: str = "openrouter/free"
+    HERMES_MODEL: str = "nousresearch/hermes-3-llama-3.1-8b"
     MAX_HISTORY: int = 500
     SESSION_FILE: Path = Path("session.json")
     LOG_LEVEL: str = "INFO"
@@ -284,9 +285,11 @@ openrouter = OpenRouterClient(CFG.OPENROUTER_API_KEY, CFG.HERMES_MODEL)
 
 # ─── Utilidades de formato ───
 SYSTEM_PROMPT = (
-    "Eres un asistente útil en Discord. "
-    "Responde en español, sé conciso, directo y útil. "
-    "Mantén el contexto de la conversación compartida."
+    "Eres un asistente amigable en Discord. "
+    "Responde en español de forma natural, como un amigo. "
+    "No corrijas al usuario, no des lecciones, solo conversa y ayuda. "
+    "Mantén el contexto de la conversación compartida. "
+    "Si no sabes algo, dilo con humildad."
 )
 
 def build_messages(history: List[dict]) -> List[dict]:
@@ -294,6 +297,52 @@ def build_messages(history: List[dict]) -> List[dict]:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend({"role": m["role"], "content": m["content"]} for m in history)
     return msgs
+
+
+# ─── Búsqueda web (DuckDuckGo HTML scrape, gratis) ───
+async def web_search(query: str, max_results: int = 5) -> List[dict]:
+    """Busca en DuckDuckGo y devuelve [{title, url, snippet}, ...]"""
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": query, "kl": "es-es"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(url, data=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                html = await resp.text()
+    except Exception as e:
+        log.warning(f"Error búsqueda web: {e}")
+        return []
+
+    # Parsear HTML simple
+    results = []
+    snippet_pattern = r'class="result__snippet">(.*?)</a>'
+    url_pattern = r'class="result__url">(.*?)</a>'
+    title_pattern = r'class="result__title">.*?<a[^>]*>(.*?)</a>'
+    
+    snippets = re.findall(snippet_pattern, html, re.DOTALL)
+    urls = re.findall(url_pattern, html, re.DOTALL)
+    titles = re.findall(title_pattern, html, re.DOTALL)
+    
+    for i in range(min(max_results, len(snippets))):
+        title = re.sub(r'<[^>]+>', '', titles[i]).strip() if i < len(titles) else "Resultado"
+        url_clean = re.sub(r'<[^>]+>', '', urls[i]).strip() if i < len(urls) else ""
+        snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()[:300]
+        if url_clean and not url_clean.startswith("http"):
+            url_clean = "https://" + url_clean
+        results.append({"title": title, "url": url_clean, "snippet": snippet})
+    
+    return results
+
+
+def format_search_results(results: List[dict]) -> str:
+    """Formatea resultados para inyectar en prompt."""
+    if not results:
+        return "Sin resultados de búsqueda."
+    lines = ["🔍 **Resultados de búsqueda:**"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. **{r['title']}**\n   {r['snippet']}\n   🔗 {r['url']}")
+    return "\n".join(lines)
 
 # ─── Bot Discord ───
 intents = discord.Intents.default()
@@ -415,7 +464,24 @@ async def handle_openrouter_message(message: discord.Message):
 
     # Preparar historial (usar historial del hilo/canal objetivo)
     history = session.get_history(target_channel.id)
-    messages = build_messages(history)
+    
+    # Detectar si necesita búsqueda web (palabras clave)
+    search_keywords = ["busca", "buscar", "google", "internet", "web", "última", "actual", "hoy", "precio", "noticia", "link", "enlace", "url", "fuente"]
+    needs_search = any(kw in user_msg.lower() for kw in search_keywords)
+    
+    search_context = ""
+    if needs_search:
+        await target_channel.send("🔍 Buscando en la web...")
+        results = await web_search(user_msg)
+        search_context = format_search_results(results)
+        if search_context != "Sin resultados de búsqueda.":
+            # Inyectar resultados como mensaje de sistema adicional
+            messages = build_messages(history)
+            messages.insert(1, {"role": "system", "content": f"Información actual de búsqueda web:\n{search_context}"})
+        else:
+            messages = build_messages(history)
+    else:
+        messages = build_messages(history)
 
     # Streaming response
     async with target_channel.typing():
