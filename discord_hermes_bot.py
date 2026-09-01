@@ -40,6 +40,8 @@ class Config:
     USER_COOLDOWN_SECONDS: int = 30
     REQUEST_TIMEOUT: int = 30
     STREAM_TIMEOUT: int = 120
+    THREAD_INACTIVITY_MINUTES: int = 10
+    THREAD_AUTO_ARCHIVE_MINUTES: int = 60
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -138,6 +140,71 @@ class SharedSession:
         }
 
 session = SharedSession(CFG.MAX_HISTORY, CFG.SESSION_FILE)
+
+# ─── Thread management ───
+async def create_thread_session(message: discord.Message, user_msg: str) -> discord.Thread:
+    """Crea hilo a partir de mención en canal normal."""
+    thread_name = f"💬 {message.author.display_name} • {user_msg[:50]}"
+    thread = await message.create_thread(
+        name=thread_name[:100],
+        auto_archive_duration=CFG.THREAD_AUTO_ARCHIVE_MINUTES,
+        reason="Sesión de chat con bot"
+    )
+    # Copiar historial del canal al hilo (contexto compartido)
+    history = session.get_history(message.channel.id)
+    for msg in history:
+        session.add(thread.id, msg["role"], msg["content"], msg.get("author", ""))
+    
+    _active_threads[message.channel.id] = {
+        "thread_id": thread.id,
+        "last_activity": time.monotonic(),
+        "creator_id": message.author.id,
+    }
+    log.info(f"Hilo creado: {thread.id} para canal {message.channel.id}")
+    return thread
+
+
+async def update_thread_activity(channel_id: int) -> None:
+    """Actualiza timestamp de actividad del hilo."""
+    if channel_id in _active_threads:
+        _active_threads[channel_id]["last_activity"] = time.monotonic()
+
+
+async def archive_thread_session(channel_id: int) -> None:
+    """Archiva hilo y limpia tracking."""
+    data = _active_threads.pop(channel_id, None)
+    if not data:
+        return
+    thread = bot.get_channel(data["thread_id"])
+    if thread and isinstance(thread, discord.Thread):
+        try:
+            await thread.edit(archived=True, locked=True)
+            log.info(f"Hilo archivado por inactividad: {thread.id}")
+        except Exception as e:
+            log.warning(f"Error archivando hilo {thread.id}: {e}")
+    # Opcional: limpiar sesión del hilo
+    # session.clear(data["thread_id"])
+
+
+async def thread_cleanup_loop() -> None:
+    """Background task: revisa hilos inactivos cada minuto."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now = time.monotonic()
+            inactive = []
+            for channel_id, data in _active_threads.items():
+                idle_minutes = (now - data["last_activity"]) / 60
+                if idle_minutes >= CFG.THREAD_INACTIVITY_MINUTES:
+                    inactive.append(channel_id)
+            
+            for channel_id in inactive:
+                await archive_thread_session(channel_id)
+                
+        except Exception as e:
+            log.error(f"Error en thread_cleanup_loop: {e}")
+        
+        await asyncio.sleep(60)  # cada minuto
 
 # ─── Cliente OpenRouter (OpenAI-compatible) ───
 class OpenRouterClient:
@@ -243,6 +310,11 @@ async def on_ready():
     except Exception as e:
         log.error(f"Error sincronizando comandos: {e}")
 
+    # Iniciar thread cleanup loop
+    global _thread_cleanup_task
+    _thread_cleanup_task = bot.loop.create_task(thread_cleanup_loop())
+    log.info("Thread cleanup loop iniciado")
+
     # Health check server en EL MISMO loop del bot
     bot.loop.create_task(start_health_server())
 
@@ -251,8 +323,29 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Mención @bot o DM → respuesta con OpenRouter
-    if bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel):
+    # DM → respuesta directa
+    if isinstance(message.channel, discord.DMChannel):
+        await handle_openrouter_message(message)
+        return
+
+    # Hilo activo → responder SIN mención (si bot participa)
+    if isinstance(message.channel, discord.Thread):
+        # Verificar si este hilo es nuestro
+        parent_id = message.channel.parent_id
+        if parent_id in _active_threads and _active_threads[parent_id]["thread_id"] == message.channel.id:
+            await update_thread_activity(parent_id)
+            await handle_openrouter_message(message)
+            return
+        # Si no es nuestro hilo, solo guardar contexto pasivo
+        session.add(message.channel.id, "user", message.content, str(message.author))
+        return
+
+    # Canal normal: mención @bot O mensaje que empieza con "membri" → crear hilo + responder
+    content_lower = message.content.lower().strip()
+    is_mention = bot.user.mentioned_in(message)
+    is_membri = content_lower.startswith("membri")
+    
+    if is_mention or is_membri:
         await handle_openrouter_message(message)
         return
 
@@ -262,7 +355,7 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 async def handle_openrouter_message(message: discord.Message):
-    """Procesa mención @bot o DM y responde con streaming."""
+    """Procesa mención @bot o DM/hilo y responde con streaming."""
     channel = message.channel
     user_id = message.author.id
 
@@ -272,13 +365,17 @@ async def handle_openrouter_message(message: discord.Message):
         await channel.send(f"⏳ Espera {retry_after:.0f}s antes de otro mensaje (protección de cuota gratuita).")
         return
 
-    # Limpiar mención del bot
+    # Limpiar mención del bot Y prefijo "membri"
     user_msg = (
         message.content
         .replace(f"<@!{bot.user.id}>", "")
         .replace(f"<@{bot.user.id}>", "")
         .strip()
     )
+    
+    # Quitar prefijo "membri" (case insensitive)
+    if user_msg.lower().startswith("membri"):
+        user_msg = user_msg[6:].lstrip(" :,-")
 
     if not user_msg:
         await channel.send("👋 ¡Hola! Mencióname o escríbeme por DM para charlar.")
@@ -289,15 +386,28 @@ async def handle_openrouter_message(message: discord.Message):
         await channel.send("❌ Mensaje muy largo (máx 4000 chars).")
         return
 
-    # Guardar mensaje usuario
-    session.add(channel.id, "user", user_msg, str(message.author))
+    # Si es canal normal (no hilo ni DM), crear hilo
+    target_channel = channel
+    parent_channel_id = None
+    if isinstance(channel, discord.TextChannel) and not isinstance(channel, discord.Thread):
+        parent_channel_id = channel.id
+        thread = await create_thread_session(message, user_msg)
+        target_channel = thread
+        # Enviar confirmación en el hilo
+        await thread.send(f"🧵 **Hilo creado**. Continuamos aquí sin necesidad de mencionarme.\n\n{message.author.mention}: {user_msg}")
 
-    # Preparar historial
-    history = session.get_history(channel.id)
+    # Guardar mensaje usuario (en hilo o canal original)
+    session.add(target_channel.id, "user", user_msg, str(message.author))
+    # También guardar en canal padre para contexto compartido
+    if parent_channel_id:
+        session.add(parent_channel_id, "user", user_msg, str(message.author))
+
+    # Preparar historial (usar historial del hilo/canal objetivo)
+    history = session.get_history(target_channel.id)
     messages = build_messages(history)
 
     # Streaming response
-    async with channel.typing():
+    async with target_channel.typing():
         try:
             response_chunks = []
             reply_msg = None
@@ -308,12 +418,12 @@ async def handle_openrouter_message(message: discord.Message):
                 full = "".join(response_chunks)
 
                 if reply_msg is None:
-                    reply_msg = await channel.send(full + "▌")
+                    reply_msg = await target_channel.send(full + "▌")
                 elif len(full) % 50 == 0:
                     try:
                         await reply_msg.edit(content=full + "▌")
                     except (discord.NotFound, discord.HTTPException):
-                        reply_msg = await channel.send(full + "▌")
+                        reply_msg = await target_channel.send(full + "▌")
 
             final_text = "".join(response_chunks).strip()
             latency = time.monotonic() - start_time
@@ -321,21 +431,28 @@ async def handle_openrouter_message(message: discord.Message):
             if reply_msg:
                 await reply_msg.edit(content=final_text)
             else:
-                await channel.send(final_text)
+                await target_channel.send(final_text)
 
             # Guardar respuesta del bot
-            session.add(channel.id, "assistant", final_text, bot.user.name)
-            log.info(f"Respuesta OK | canal={channel.id} user={user_id} latency={latency:.1f}s chars={len(final_text)}")
+            session.add(target_channel.id, "assistant", final_text, bot.user.name)
+            if parent_channel_id:
+                session.add(parent_channel_id, "assistant", final_text, bot.user.name)
+            
+            # Actualizar actividad del hilo
+            if parent_channel_id:
+                await update_thread_activity(parent_channel_id)
+
+            log.info(f"Respuesta OK | canal={target_channel.id} user={user_id} latency={latency:.1f}s chars={len(final_text)}")
 
         except RuntimeError as e:
             if str(e) == "RATE_LIMIT":
-                await channel.send("⚠️ Cuota gratuita agotada (429). Intenta en unos minutos.")
+                await target_channel.send("⚠️ Cuota gratuita agotada (429). Intenta en unos minutos.")
                 log.warning(f"Rate limit 429 | user={user_id}")
             else:
-                await channel.send(f"❌ {e}")
+                await target_channel.send(f"❌ {e}")
                 log.error(f"Error OpenRouter: {e} | user={user_id}")
         except Exception as e:
-            await channel.send("❌ Error inesperado. Intenta de nuevo.")
+            await target_channel.send("❌ Error inesperado. Intenta de nuevo.")
             log.exception(f"Error en handle_openrouter_message | user={user_id}")
 
 # ─── Slash Commands ───
