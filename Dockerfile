@@ -1,35 +1,30 @@
-# Dockerfile para Render free tier (512 MB RAM)
+# Single-stage Dockerfile for Discord Bot (Python 3.11 slim)
+# ~100MB final image, no Hermes, no local models
+
 FROM python:3.11-slim
 
-# Instalar dependencias del sistema (mínimas para ahorrar memoria)
+# System deps (minimal)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar Hermes Agent (script oficial - instala en ~/.local/bin)
-RUN curl -fsSL https://get.hermes-agent.com | sh -s -- -b /root/.local/bin
-
-# Agregar al PATH
-ENV PATH="/root/.local/bin:${PATH}"
-
-# Verificar instalación
-RUN hermes --version || echo "Hermes instalado en ~/.local/bin"
-
-# Python deps
+# Non-root user
+RUN useradd -m -u 1000 botuser
 WORKDIR /app
+
+# Copy requirements first (cache layer)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
-COPY discord_hermes_bot.py start_services.sh ./
-RUN chmod +x start_services.sh
+# Copy bot code
+COPY discord_hermes_bot.py .
 
-# Puertos: 9119 (Hermes), 8080 (health check bot)
-EXPOSE 8080 9119
+# Ownership
+RUN chown -R botuser:botuser /app
+USER botuser
 
-# Variables de entorno por defecto
-ENV HERMES_PROVIDER=opencode-free
-ENV HERMES_MODEL=nemotron-3-ultra-free
+# Render expects port 8080 for health checks
+EXPOSE 8080
 
-# Script de arranque robusto
-CMD ["./start_services.sh"]
+# Run bot
+CMD ["python", "discord_hermes_bot.py"]

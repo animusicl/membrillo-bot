@@ -1,15 +1,24 @@
 # .dockerignore
-__pycache__
+# Exclude local dev files from Docker build context
+
+.env
+.env.*
+session.json
+__pycache__/
 *.pyc
 *.pyo
-*.pyd
-.Python
-venv
-.env
-session.json
-logs
-*.log
-.git
+.pytest_cache/
+.coverage
+.git/
 .gitignore
-*.bat
-*.md
+README.md
+Dockerfile*
+docker-compose*
+render.yaml
+*.log
+*.tmp
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

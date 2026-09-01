@@ -1,18 +1,17 @@
 services:
   - type: web
-    name: hermes-discord-bot
+    name: discord-openrouter-bot
     runtime: docker
-    repo: https://github.com/animusicl/membrillo-bot
-    branch: master
-    dockerfilePath: ./Dockerfile.bot
+    dockerfilePath: ./Dockerfile
     plan: free
+    region: frankfurt
     healthCheckPath: /health
     envVars:
       - key: DISCORD_TOKEN
         sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
       - key: HERMES_MODEL
-        value: nemotron-3-ultra-free
+        value: openrouter/free
       - key: MAX_HISTORY
         value: "500"
-      - key: HERMES_URL
-        value: https://TU_URL_TAILSCALE.tailscale.net  # CAMBIA ESTO

@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Discord Bot + Hermes Agent (sesión compartida por canal)
-- Guarda historial en session.json por canal
+Discord Bot + OpenRouter (modelos gratuitos)
+- Sesión compartida por canal (session.json)
 - Límite configurable MAX_HISTORY
 - Comandos slash + menciones @bot
 - Streaming de respuestas
-- Arquitectura modular y escalable
+- Rate limit por usuario + manejo 429
+- Arquitectura simple, un solo contenedor
 """
 
 import os
 import json
 import asyncio
 import logging
+import time
 from collections import deque
 from pathlib import Path
-from typing import Dict, Deque, List, Optional, Any
-from dataclasses import dataclass, asdict
+from typing import Dict, Deque, List, Optional, Any, AsyncGenerator
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 
 import discord
@@ -30,38 +32,57 @@ load_dotenv()
 @dataclass(frozen=True)
 class Config:
     DISCORD_TOKEN: str
-    HERMES_MODEL: str = "nemotron-3-ultra-free"
+    OPENROUTER_API_KEY: str
+    HERMES_MODEL: str = "openrouter/free"
     MAX_HISTORY: int = 500
-    HERMES_URL: str = "http://localhost:9119"
     SESSION_FILE: Path = Path("session.json")
     LOG_LEVEL: str = "INFO"
+    USER_COOLDOWN_SECONDS: int = 30
+    REQUEST_TIMEOUT: int = 30
+    STREAM_TIMEOUT: int = 120
 
     @classmethod
     def from_env(cls) -> "Config":
         token = os.getenv("DISCORD_TOKEN")
         if not token:
             raise ValueError("Falta DISCORD_TOKEN en .env")
+        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("Falta OPENROUTER_API_KEY (o OPEN_ROUTER_API_KEY) en .env")
         return cls(
             DISCORD_TOKEN=token,
-            HERMES_MODEL=os.getenv("HERMES_MODEL", "nemotron-3-ultra-free"),
+            OPENROUTER_API_KEY=api_key,
+            HERMES_MODEL=os.getenv("HERMES_MODEL", "openrouter/free"),
             MAX_HISTORY=int(os.getenv("MAX_HISTORY", "500")),
-            HERMES_URL=os.getenv("HERMES_URL", "http://localhost:9119"),
         )
 
 CFG = Config.from_env()
 
-# ─── Logging estructurado ───
+# ─── Logging estructurado (sin secrets, sin contenido) ───
 logging.basicConfig(
     level=getattr(logging, CFG.LOG_LEVEL),
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("hermes-discord-bot")
+log = logging.getLogger("discord-openrouter-bot")
+
+# ─── Rate limit simple por usuario ───
+_user_last_request: Dict[int, float] = {}
+
+def check_rate_limit(user_id: int) -> Optional[float]:
+    """Retorna segundos restantes si en cooldown, None si OK."""
+    now = time.monotonic()
+    last = _user_last_request.get(user_id, 0)
+    elapsed = now - last
+    if elapsed < CFG.USER_COOLDOWN_SECONDS:
+        return CFG.USER_COOLDOWN_SECONDS - elapsed
+    _user_last_request[user_id] = now
+    return None
 
 # ─── Capa de persistencia (sesión compartida) ───
 class SharedSession:
     """Sesión compartida por canal con persistencia JSON atómica."""
-    
+
     def __init__(self, max_history: int, session_file: Path):
         self.max_history = max_history
         self.session_file = session_file
@@ -86,7 +107,7 @@ class SharedSession:
         try:
             serializable = {k: list(v) for k, v in self._data.items()}
             tmp.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self.session_file)  # atómico en POSIX/Windows
+            tmp.replace(self.session_file)
         except Exception as e:
             log.error(f"Error guardando sesión: {e}")
             if tmp.exists():
@@ -118,27 +139,29 @@ class SharedSession:
 
 session = SharedSession(CFG.MAX_HISTORY, CFG.SESSION_FILE)
 
-# ─── Cliente Hermes (API local) ───
-class HermesClient:
-    """Cliente asíncrono para Hermes Agent API (OpenAI-compatible)."""
-    
-    def __init__(self, base_url: str, model: str):
-        self.base_url = base_url.rstrip("/")
+# ─── Cliente OpenRouter (OpenAI-compatible) ───
+class OpenRouterClient:
+    """Cliente asíncrono para OpenRouter API (OpenAI-compatible)."""
+
+    def __init__(self, api_key: str, model: str):
+        self.api_key = api_key
         self.model = model
+        self.base_url = "https://openrouter.ai/api/v1"
         self._session: Optional[aiohttp.ClientSession] = None
 
     @asynccontextmanager
     async def _get_session(self):
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=CFG.REQUEST_TIMEOUT, sock_read=CFG.STREAM_TIMEOUT)
+            self._session = aiohttp.ClientSession(timeout=timeout)
         yield self._session
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def chat_stream(self, messages: List[dict]) -> Any:
-        """Genera chunks de respuesta desde Hermes /v1/chat/completions."""
+    async def chat_stream(self, messages: List[dict]) -> AsyncGenerator[str, None]:
+        """Genera chunks de respuesta desde OpenRouter /chat/completions."""
         payload = {
             "model": self.model,
             "messages": messages,
@@ -146,14 +169,22 @@ class HermesClient:
             "temperature": 0.7,
             "max_tokens": 4000,
         }
-        url = f"{self.base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/animusicl/membrillo-bot",
+            "X-Title": "Membrillo Discord Bot",
+        }
+        url = f"{self.base_url}/chat/completions"
 
         async with self._get_session() as sess:
             try:
-                async with sess.post(url, json=payload) as resp:
+                async with sess.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 429:
+                        raise RuntimeError("RATE_LIMIT")
                     if resp.status != 200:
                         text = await resp.text()
-                        raise RuntimeError(f"Hermes HTTP {resp.status}: {text[:200]}")
+                        raise RuntimeError(f"OpenRouter HTTP {resp.status}: {text[:200]}")
 
                     async for line in resp.content:
                         line = line.decode("utf-8").strip()
@@ -170,14 +201,15 @@ class HermesClient:
                                 continue
 
             except aiohttp.ClientConnectorError:
-                raise RuntimeError(
-                    f"No se puede conectar a Hermes en {self.base_url}. "
-                    "¿Está corriendo? (hermes serve)"
-                )
+                raise RuntimeError("No se puede conectar a OpenRouter. ¿Internet/VPN?")
+            except asyncio.TimeoutError:
+                raise RuntimeError("Timeout conectando a OpenRouter")
+            except RuntimeError:
+                raise
             except Exception as e:
-                raise RuntimeError(f"Error Hermes: {e}")
+                raise RuntimeError(f"Error OpenRouter: {e}")
 
-hermes = HermesClient(CFG.HERMES_URL, CFG.HERMES_MODEL)
+openrouter = OpenRouterClient(CFG.OPENROUTER_API_KEY, CFG.HERMES_MODEL)
 
 # ─── Utilidades de formato ───
 SYSTEM_PROMPT = (
@@ -187,7 +219,7 @@ SYSTEM_PROMPT = (
 )
 
 def build_messages(history: List[dict]) -> List[dict]:
-    """Construye la lista de mensajes para Hermes con system prompt."""
+    """Construye la lista de mensajes para OpenRouter con system prompt."""
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend({"role": m["role"], "content": m["content"]} for m in history)
     return msgs
@@ -204,13 +236,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     log.info(f"Conectado como {bot.user} (ID: {bot.user.id})")
     log.info(f"Servers: {[g.name for g in bot.guilds]}")
+    log.info(f"Modelo: {CFG.HERMES_MODEL}")
     try:
         synced = await bot.tree.sync()
         log.info(f"Slash commands sincronizados: {len(synced)}")
     except Exception as e:
         log.error(f"Error sincronizando comandos: {e}")
-    
-    # Iniciar health check server en EL MISMO loop del bot
+
+    # Health check server en EL MISMO loop del bot
     bot.loop.create_task(start_health_server())
 
 @bot.event
@@ -218,9 +251,9 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Mención @bot o DM → respuesta con Hermes
+    # Mención @bot o DM → respuesta con OpenRouter
     if bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel):
-        await handle_hermes_message(message)
+        await handle_openrouter_message(message)
         return
 
     # Guardar mensaje de usuario en historial (contexto pasivo)
@@ -228,9 +261,17 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-async def handle_hermes_message(message: discord.Message):
+async def handle_openrouter_message(message: discord.Message):
     """Procesa mención @bot o DM y responde con streaming."""
     channel = message.channel
+    user_id = message.author.id
+
+    # Rate limit
+    retry_after = check_rate_limit(user_id)
+    if retry_after is not None:
+        await channel.send(f"⏳ Espera {retry_after:.0f}s antes de otro mensaje (protección de cuota gratuita).")
+        return
+
     # Limpiar mención del bot
     user_msg = (
         message.content
@@ -241,6 +282,11 @@ async def handle_hermes_message(message: discord.Message):
 
     if not user_msg:
         await channel.send("👋 ¡Hola! Mencióname o escríbeme por DM para charlar.")
+        return
+
+    # Validar longitud
+    if len(user_msg) > 4000:
+        await channel.send("❌ Mensaje muy largo (máx 4000 chars).")
         return
 
     # Guardar mensaje usuario
@@ -255,8 +301,9 @@ async def handle_hermes_message(message: discord.Message):
         try:
             response_chunks = []
             reply_msg = None
+            start_time = time.monotonic()
 
-            async for chunk in hermes.chat_stream(messages):
+            async for chunk in openrouter.chat_stream(messages):
                 response_chunks.append(chunk)
                 full = "".join(response_chunks)
 
@@ -269,6 +316,8 @@ async def handle_hermes_message(message: discord.Message):
                         reply_msg = await channel.send(full + "▌")
 
             final_text = "".join(response_chunks).strip()
+            latency = time.monotonic() - start_time
+
             if reply_msg:
                 await reply_msg.edit(content=final_text)
             else:
@@ -276,16 +325,21 @@ async def handle_hermes_message(message: discord.Message):
 
             # Guardar respuesta del bot
             session.add(channel.id, "assistant", final_text, bot.user.name)
+            log.info(f"Respuesta OK | canal={channel.id} user={user_id} latency={latency:.1f}s chars={len(final_text)}")
 
         except RuntimeError as e:
-            await channel.send(f"❌ {e}")
-            log.error(f"Error Hermes: {e}")
+            if str(e) == "RATE_LIMIT":
+                await channel.send("⚠️ Cuota gratuita agotada (429). Intenta en unos minutos.")
+                log.warning(f"Rate limit 429 | user={user_id}")
+            else:
+                await channel.send(f"❌ {e}")
+                log.error(f"Error OpenRouter: {e} | user={user_id}")
         except Exception as e:
-            await channel.send(f"❌ Error inesperado: {e}")
-            log.exception("Error en handle_hermes_message")
+            await channel.send("❌ Error inesperado. Intenta de nuevo.")
+            log.exception(f"Error en handle_openrouter_message | user={user_id}")
 
 # ─── Slash Commands ───
-@bot.tree.command(name="chat", description="Habla con Hermes (igual que mencionar al bot)")
+@bot.tree.command(name="chat", description="Habla con el bot (igual que mencionar)")
 @app_commands.describe(mensaje="Qué quieres decirle")
 async def slash_chat(interaction: discord.Interaction, mensaje: str):
     await interaction.response.defer(thinking=True)
@@ -295,18 +349,18 @@ async def slash_chat(interaction: discord.Interaction, mensaje: str):
             self.channel = channel
             self.author = author
     fake = FakeMessage(mensaje, interaction.channel, interaction.user)
-    await handle_hermes_message(fake)
+    await handle_openrouter_message(fake)
 
 @bot.tree.command(name="reset", description="Borra el historial de este canal")
 async def slash_reset(interaction: discord.Interaction):
     session.clear(interaction.channel.id)
     await interaction.response.send_message("🗑️ Historial de este canal borrado.", ephemeral=True)
 
-@bot.tree.command(name="history", description="Muestra cuántos mensajes hay en el historial de este canal")
+@bot.tree.command(name="history", description="Mensajes en el historial de este canal")
 async def slash_history(interaction: discord.Interaction):
     count = len(session.get_history(interaction.channel.id))
     await interaction.response.send_message(
-        f"📜 Mensajes en contexto: **{count}/{CFG.MAX_HISTORY}**", 
+        f"📜 Mensajes en contexto: **{count}/{CFG.MAX_HISTORY}**",
         ephemeral=True
     )
 
@@ -316,7 +370,7 @@ async def slash_status(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"🤖 **Bot:** {bot.user.name}\n"
         f"🧠 **Modelo:** {CFG.HERMES_MODEL}\n"
-        f"🌐 **Hermes:** {CFG.HERMES_URL}\n"
+        f"🌐 **API:** OpenRouter\n"
         f"📊 **Canales con historial:** {stats['canales']}\n"
         f"💬 **Total mensajes:** {stats['total_mensajes']}\n"
         f"⚙️ **Max history:** {stats['max_history']}\n"
@@ -329,18 +383,19 @@ async def slash_config(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"⚙️ **Configuración:**\n"
         f"• Modelo: `{CFG.HERMES_MODEL}`\n"
-        f"• Hermes URL: `{CFG.HERMES_URL}`\n"
+        f"• API: OpenRouter\n"
         f"• Max history: `{CFG.MAX_HISTORY}`\n"
+        f"• Cooldown usuario: `{CFG.USER_COOLDOWN_SECONDS}s`\n"
         f"• Session file: `{CFG.SESSION_FILE}`",
         ephemeral=True
     )
 
 # ─── Lifecycle ───
 async def shutdown():
-    await hermes.close()
+    await openrouter.close()
     log.info("Recursos liberados")
 
-# ─── Health check server (para Koyeb/Railway) ───
+# ─── Health check server (para Render) ───
 from aiohttp import web
 
 async def health_check(request):
@@ -356,10 +411,10 @@ async def start_health_server():
     log.info("Health check server en puerto 8080")
 
 if __name__ == "__main__":
-    log.info("Iniciando Hermes Discord Bot...")
-    log.info(f"Hermes URL: {CFG.HERMES_URL}")
+    log.info("Iniciando Discord + OpenRouter Bot...")
     log.info(f"Modelo: {CFG.HERMES_MODEL}")
     log.info(f"Max history: {CFG.MAX_HISTORY}")
+    log.info(f"Cooldown usuario: {CFG.USER_COOLDOWN_SECONDS}s")
 
     try:
         bot.run(CFG.DISCORD_TOKEN)
@@ -368,5 +423,4 @@ if __name__ == "__main__":
     except Exception as e:
         log.exception(f"Error fatal: {e}")
     finally:
-        # Nota: bot.run() bloquea, el cleanup real ocurre en signal handler si hace falta
         pass
