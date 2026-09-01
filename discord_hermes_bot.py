@@ -289,7 +289,9 @@ SYSTEM_PROMPT = (
     "Responde en español de forma natural, como un amigo. "
     "No corrijas al usuario, no des lecciones, solo conversa y ayuda. "
     "Mantén el contexto de la conversación compartida. "
-    "Si no sabes algo, dilo con humildad."
+    "Si no sabes algo, dilo con humildad. "
+    "CUANDO HAY RESULTADOS DE BÚSQUEDA WEB: SIEMPRE incluye los links (URLs) en tu respuesta. "
+    "Los usuarios NECESITAN los enlaces para verificar y visitar las fuentes."
 )
 
 def build_messages(history: List[dict]) -> List[dict]:
