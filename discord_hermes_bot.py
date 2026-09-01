@@ -37,7 +37,7 @@ class Config:
     MAX_HISTORY: int = 500
     SESSION_FILE: Path = Path("session.json")
     LOG_LEVEL: str = "INFO"
-    USER_COOLDOWN_SECONDS: int = 30
+    USER_COOLDOWN_SECONDS: int = 3
     REQUEST_TIMEOUT: int = 30
     STREAM_TIMEOUT: int = 120
     THREAD_INACTIVITY_MINUTES: int = 10
@@ -140,6 +140,10 @@ class SharedSession:
         }
 
 session = SharedSession(CFG.MAX_HISTORY, CFG.SESSION_FILE)
+
+# ─── Thread session tracking ───
+_active_threads: Dict[int, dict] = {}
+_thread_cleanup_task: Optional[asyncio.Task] = None
 
 # ─── Thread management ───
 async def create_thread_session(message: discord.Message, user_msg: str) -> discord.Thread:
@@ -373,13 +377,20 @@ async def handle_openrouter_message(message: discord.Message):
         .strip()
     )
     
+    # Detectar si era trigger "membri" (para saludar aunque no haya mensaje extra)
+    was_membri_trigger = user_msg.lower().startswith("membri")
+    
     # Quitar prefijo "membri" (case insensitive)
-    if user_msg.lower().startswith("membri"):
+    if was_membri_trigger:
         user_msg = user_msg[6:].lstrip(" :,-")
 
-    if not user_msg:
+    if not user_msg and not was_membri_trigger:
         await channel.send("👋 ¡Hola! Mencióname o escríbeme por DM para charlar.")
         return
+    
+    # Si era trigger "membri" sin texto extra, usar saludo por defecto
+    if not user_msg and was_membri_trigger:
+        user_msg = "hola"
 
     # Validar longitud
     if len(user_msg) > 4000:
