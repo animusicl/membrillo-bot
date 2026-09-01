@@ -316,34 +316,50 @@ async def web_search(query: str, max_results: int = 5) -> List[dict]:
         log.warning(f"Error búsqueda web: {e}")
         return []
 
-    # Parsear HTML simple
+    # Parsear HTML: cada resultado está en <a class="result__snippet" href="URL_REAL">...
+    # y título en <a class="result__title" href="URL_REAL">TÍTULO</a>
     results = []
-    snippet_pattern = r'class="result__snippet">(.*?)</a>'
-    url_pattern = r'class="result__url">(.*?)</a>'
-    title_pattern = r'class="result__title">.*?<a[^>]*>(.*?)</a>'
     
-    snippets = re.findall(snippet_pattern, html, re.DOTALL)
-    urls = re.findall(url_pattern, html, re.DOTALL)
-    titles = re.findall(title_pattern, html, re.DOTALL)
+    # Buscar bloques de resultado completos
+    result_blocks = re.findall(
+        r'class="result__title".*?href="([^"]+)".*?>(.*?)</a>.*?class="result__snippet".*?>(.*?)</a>',
+        html, re.DOTALL
+    )
     
-    for i in range(min(max_results, len(snippets))):
-        title = re.sub(r'<[^>]+>', '', titles[i]).strip() if i < len(titles) else "Resultado"
-        url_clean = re.sub(r'<[^>]+>', '', urls[i]).strip() if i < len(urls) else ""
-        snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()[:300]
-        if url_clean and not url_clean.startswith("http"):
-            url_clean = "https://" + url_clean
-        results.append({"title": title, "url": url_clean, "snippet": snippet})
+    for href, title_html, snippet_html in result_blocks[:max_results]:
+        # Limpiar HTML
+        title = re.sub(r'<[^>]+>', '', title_html).strip()
+        snippet = re.sub(r'<[^>]+>', '', snippet_html).strip()[:300]
+        # href ya es la URL real (puede ser redirect de DDG)
+        clean_url = href
+        if clean_url.startswith("//"):
+            clean_url = "https:" + clean_url
+        elif not clean_url.startswith("http"):
+            clean_url = "https://" + clean_url
+        # DuckDuckGo a veces usa redirect: /l/?uddg=URL_REAL
+        if "/l/?uddg=" in clean_url:
+            # Extraer URL real del redirect
+            match = re.search(r'uddg=([^&]+)', clean_url)
+            if match:
+                import urllib.parse
+                clean_url = urllib.parse.unquote(match.group(1))
+        
+        results.append({"title": title, "url": clean_url, "snippet": snippet})
     
     return results
 
 
 def format_search_results(results: List[dict]) -> str:
-    """Formatea resultados para inyectar en prompt."""
+    """Formatea resultados para inyectar en prompt (markdown Discord)."""
     if not results:
         return "Sin resultados de búsqueda."
     lines = ["🔍 **Resultados de búsqueda:**"]
     for i, r in enumerate(results, 1):
-        lines.append(f"{i}. **{r['title']}**\n   {r['snippet']}\n   🔗 {r['url']}")
+        title = r['title']
+        url = r['url']
+        snippet = r['snippet']
+        # Formato markdown Discord: [título](url)
+        lines.append(f"{i}. **[{title}]({url})**\n   {snippet}")
     return "\n".join(lines)
 
 # ─── Bot Discord ───
